@@ -4,7 +4,16 @@
 
 ## 冻结动作
 
-用户回答后立即写入 `decisions.json`：
+优先用命令冻结（自动写 DEC、置 ANSWERED、快照 history、回打印数；重复冻结必须 `--supersede`，R5 由脚本强制）：
+
+```bash
+node $SKILL/scripts/state.mjs freeze .requirementmind Q-007 B --impact "RedPacketService.java:201,red_packetMapper.updateStatus"
+node $SKILL/scripts/state.mjs freeze .requirementmind CON-002 "以代码为准：status=2 保持 STOPPED，新增 status=3=EXPIRED"  # 冲突裁决 → RESOLVED + 回填 resolution_decision_id（question_id 记 CON id）
+```
+
+手工写 JSON 仅用于命令覆盖不了的调整，写完必须 `validate`。
+
+用户回答后写入 `decisions.json` 的结构：
 
 ```json
 {

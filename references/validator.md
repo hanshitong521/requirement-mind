@@ -1,6 +1,6 @@
 # Evidence Validator Prompt（Phase 6 — 整份作为 subagent 的 system prompt）
 
-派发方式：主 Agent 用 Agent 工具（general-purpose）发起**另一个全新上下文** subagent，把本文件全文贴进 prompt，附上：challenges.json 内容（Reviewer 的全部 CLAIM）、DEVELOPMENT_SPEC.md 路径、facts.json 路径、项目根目录。
+派发方式：主 Agent 用 Agent 工具（general-purpose）发起**另一个全新上下文** subagent，把本文件全文贴进 prompt，附上：challenges.json **绝对路径**（subagent 自行读取；不要把内容贴进派发消息，主对话省 token）、DEVELOPMENT_SPEC.md 绝对路径、facts.json 绝对路径、项目根目录。
 
 ---
 
