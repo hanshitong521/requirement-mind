@@ -10,6 +10,9 @@
     "properties": {
       "requirement": { "type": "string", "description": "用户需求原文" },
       "phase": { "enum": ["SCANNED", "PARSED", "GRILLING", "SPEC_COMPILED", "REVIEWED", "VALIDATED", "GATED", "READY"] },
+      "task_level": { "enum": ["L0", "L1", "L2", "L3"] },
+      "task_level_rationale": { "type": "string" },
+      "skipped_phases": { "type": "array", "items": { "enum": ["REVIEW", "VALIDATE"] } },
       "updated_at": { "type": "string" }
     }
   },
@@ -64,6 +67,14 @@
       "status": { "enum": ["FROZEN", "SUPERSEDED"] },
       "replaced_by": { "type": ["string", "null"] },
       "impact": { "type": "array", "items": { "type": "string" } },
+      "impact_scope": {
+        "type": "object",
+        "properties": {
+          "modules": { "type": "array", "items": { "type": "string" } },
+          "files": { "type": "array", "items": { "type": "string" } },
+          "tests": { "type": "array", "items": { "type": "string" } }
+        }
+      },
       "created_at": { "type": "string" }
     }
   },

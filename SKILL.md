@@ -39,15 +39,29 @@ Skill home：本文件所在目录，下称 `$SKILL`。加载后将其展开为�
 ├── conflicts.json    # CON-xxx 冲突（severity: BLOCKING|IMPORTANT）
 ├── challenges.json   # CH-xxx  Reviewer 的 CLAIM
 ├── evidence.json     # 裁决：CONFIRMED | PLAUSIBLE | REFUTED
-├── gate.json         # Gate 检查表 + 最终状态
-└── history/          # 每轮快照
+├── gate.json              # Gate 检查表 + 最终状态
+├── evidence-ledger.json   # 可交付主张证据账（P1）
+├── change-budget.json     # 开发变更上限（L2/L3 必填）
+├── decision-graph.json    # 决策影响图（由脚本生成）
+└── history/               # 每轮快照
 ```
 
 Schema 定义见 `$SKILL/schemas/state.schema.json`。会话中断后从这里恢复，禁止凭聊天记忆续跑。
 
+**跨栈 Contract**：`state.mjs context` 导出 `shared/schemas/decision-context.contract.json` 形状，供 ConciseMind HANDOFF / AI-Code / TestMind 消费。升级设计见 `shared/docs/RequirementMind_ConciseMind_Peak_Upgrade_Specification_v2.md`。
+
 ## 工作流
 
 用户给出需求后，按顺序执行下列阶段。每个阶段先读对应的 `references/` 规则文件再动手。
+
+### Phase 0 — Complexity Router → `references/complexity-router.md`
+为需求定 **task_level**（L0–L3），避免简单改动走全套审查。
+
+```bash
+node $SKILL/scripts/state.mjs route .requirementmind [--write]
+```
+
+L0 可跳过 Phase 5–6（须在 `session.json` 记 `skipped_phases`）；L2/L3 禁止跳过，且开发前须 `budget --write` 与完整 Review/Validator。
 
 ### Phase 1 — Context Scanner → `references/scanner.md`
 扫描目标项目（Java 系优先），产出 `facts.json` + 人读的 `PROJECT_FACTS.md`。
@@ -132,8 +146,15 @@ node $SKILL/scripts/state.mjs validate .requirementmind                    # JSO
 node $SKILL/scripts/state.mjs gate     .requirementmind                    # Gate 硬门槛汇总
 node $SKILL/scripts/state.mjs snapshot .requirementmind                    # 快照到 history/
 node $SKILL/scripts/state.mjs migrate  .requirementmind [--write]          # 旧 questions 补推荐字段（预览/写入）
+node $SKILL/scripts/state.mjs route    .requirementmind [--write]          # Complexity Router L0–L3
+node $SKILL/scripts/state.mjs budget   .requirementmind [--write] [...]    # Change Budget
+node $SKILL/scripts/state.mjs ledger   .requirementmind list|validate|append
+node $SKILL/scripts/state.mjs impact-graph .requirementmind [--write]      # Decision Impact Graph
+node $SKILL/scripts/state.mjs context  .requirementmind                    # Decision Context Contract JSON
 node $SKILL/scripts/selftest.mjs                                           # 确定性自测（改动本 skill 后必跑）
 ```
+
+修改本 Skill 须遵守 `references/skill-change-gate.md`（禁止无证据自改）。
 
 ## 下游栈（Gate READY 之后 · 禁本 skill 兼做实现）
 

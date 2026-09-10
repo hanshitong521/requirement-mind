@@ -4,7 +4,7 @@
 // 覆盖：Risk Router 分层 / Human-Only Gate（authority）/ Value Score / Stop Rule / Eval / freeze/supersede / migrate。
 // 运行: node scripts/selftest.mjs   （改动 SKILL.md / state.mjs / references 后必跑）
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, readdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -161,6 +161,22 @@ try {
     check('refuted=2（伪问题被销案）', m.review.REFUTED === 2);
     check('refuted_rate=100%', m.review.refuted_rate === '100%');
   }
+
+  console.log('▶ Peak v2（route / budget / ledger / impact-graph / context）');
+  const rt = run(['route', dir]);
+  check('route 推断 task_level', rt.code === 0 && rt.out.includes('"task_level"'), rt.out);
+  check('红包场景默认 L1', rt.out.includes('"task_level": "L1"'), rt.out);
+  const bg = run(['budget', dir, '--write']);
+  check('budget --write', bg.code === 0 && existsSync(join(dir, 'change-budget.json')));
+  const lg = run(['ledger', dir, 'append', 'mock claim', '--kind', 'TEST', '--refs', 'FACT-001']);
+  check('ledger append', lg.code === 0, lg.out);
+  const lv = run(['ledger', dir, 'validate']);
+  check('ledger validate', lv.code === 0, lv.out);
+  const ig = run(['impact-graph', dir, '--write']);
+  check('impact-graph --write', ig.code === 0 && existsSync(join(dir, 'decision-graph.json')), ig.out);
+  const cx = run(['context', dir]);
+  check('context contract_version=1', cx.code === 0 && cx.out.includes('"contract_version": 1'), cx.out);
+  check('context 含 FROZEN decisions', cx.out.includes('"decisions"'), cx.out);
 
   console.log('▶ migrate（旧版 questions 兼容 + authority/value 回填）');
   const dir2 = join(tmp, 'legacy');

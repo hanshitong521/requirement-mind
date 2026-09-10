@@ -1,1 +1,20 @@
-
+[
+  {
+    "id": "Q-001",
+    "topic": "legacy_norm",
+    "question": "选项无前缀?",
+    "reason": "migrate 测试",
+    "priority": "BLOCKING",
+    "options": ["选项甲", "选项乙"],
+    "status": "OPEN"
+  },
+  {
+    "id": "Q-002",
+    "topic": "legacy_dec",
+    "question": "已从决策推断推荐?",
+    "reason": "migrate 测试",
+    "priority": "IMPORTANT",
+    "options": ["A. 甲", "B. 乙", "C. 丙", "D. 丁"],
+    "status": "ANSWERED"
+  }
+]

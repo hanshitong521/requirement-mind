@@ -7,13 +7,18 @@ import { join } from 'node:path';
 
 const cmd = process.argv[2];
 const dir = process.argv[3];
-if (!dir || !['counters', 'frontier', 'freeze', 'risk', 'stop', 'eval', 'validate', 'gate', 'snapshot', 'migrate'].includes(cmd)) {
-  console.error('用法: node state.mjs <counters|frontier|freeze|risk|stop|eval|validate|gate|snapshot|migrate> <.requirementmind 目录> [参数]');
+if (!dir || !['counters', 'frontier', 'freeze', 'risk', 'stop', 'eval', 'validate', 'gate', 'snapshot', 'migrate', 'route', 'budget', 'ledger', 'impact-graph', 'context'].includes(cmd)) {
+  console.error('用法: node state.mjs <counters|frontier|freeze|risk|stop|eval|validate|gate|snapshot|migrate|route|budget|ledger|impact-graph|context> <.requirementmind 目录> [参数]');
   console.error('  frontier : 输出当前待问批量（OPEN 的 USER_ONLY BLOCKING+IMPORTANT + OPEN 冲突）与计数；TECHNICAL 不问用户');
   console.error('  freeze   : freeze <dir> <Q-xxx|CON-xxx> "<选项字母或决定文本>" [--supersede] [--auto] [--impact "a,b"] — 冻结为 DEC（--auto=AI 自治裁决）');
   console.error('  risk     : 校验 risk.json 八维评分 → 分层 LIGHT/FOCUSED/COUNCIL + 指定专项 Reviewer');
   console.error('  stop     : 停止条件判定（R9 + 风险维度证据覆盖率）；退出码 0 = 收敛，禁止继续追问/审查');
   console.error('  eval     : 会话指标（用户自治率 / Reviewer 验真率 / 轮次），供 Eval 闭环');
+  console.error('  route    : Complexity Router → task_level L0–L3 [--write]');
+  console.error('  budget   : Change Budget [--write] [--files N] [--modules N] [--database true|false] [--new-service true|false]');
+  console.error('  ledger   : ledger list|validate|append <claim> [--kind KIND] [--refs "a,b"] [--link DEC-001]');
+  console.error('  impact-graph : 从 decisions 生成 decision-graph.json [--write]');
+  console.error('  context  : 导出 Decision Context Contract JSON（stdout）');
   process.exit(2);
 }
 const writeFlag = process.argv.includes('--write');
@@ -152,7 +157,7 @@ function snapshot() {
   if (!existsSync(hDir)) mkdirSync(hDir, { recursive: true });
   const n = readdirSync(hDir).length + 1;
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const files = ['session.json', 'facts.json', 'questions.json', 'decisions.json', 'assumptions.json', 'conflicts.json', 'challenges.json', 'evidence.json', 'gate.json'];
+  const files = ['session.json', 'facts.json', 'questions.json', 'decisions.json', 'assumptions.json', 'conflicts.json', 'challenges.json', 'evidence.json', 'evidence-ledger.json', 'change-budget.json', 'decision-graph.json', 'gate.json'];
   const snap = {};
   for (const f of files) { const p = join(dir, f); if (existsSync(p)) snap[f] = JSON.parse(readFileSync(p, 'utf8')); }
   writeFileSync(join(hDir, `${String(n).padStart(3, '0')}-${stamp}.json`), JSON.stringify(snap, null, 2));
@@ -276,6 +281,15 @@ function freeze() {
   const impact = impactIdx >= 0 && flags[impactIdx + 1]
     ? flags[impactIdx + 1].split(',').map((s) => s.trim()).filter(Boolean)
     : undefined;
+  const splitFlag = (name) => {
+    const i = flags.indexOf(name);
+    return i >= 0 && flags[i + 1]
+      ? flags[i + 1].split(',').map((s) => s.trim()).filter(Boolean)
+      : undefined;
+  };
+  const impactFiles = splitFlag('--impact-files');
+  const impactTests = splitFlag('--impact-tests');
+  const impactModules = impact;
   if (!target || !answer || !/^(Q|CON)-\d+$/.test(target)) {
     console.error('用法: node state.mjs freeze <dir> <Q-xxx|CON-xxx> "<选项字母或决定文本>" [--supersede] [--auto] [--impact "a,b"]');
     process.exit(2);
@@ -284,6 +298,13 @@ function freeze() {
   const newId = nextId(decisions, 'DEC-');
   const base = { id: newId, question_id: target, source: auto ? 'AI_DEFAULT' : 'USER', status: 'FROZEN', created_at: new Date().toISOString() };
   if (impact) base.impact = impact;
+  if (impactModules || impactFiles || impactTests) {
+    base.impact_scope = {
+      modules: impactModules || [],
+      files: impactFiles || [],
+      tests: impactTests || [],
+    };
+  }
 
   if (target.startsWith('CON-')) {
     const conflicts = isArr(read('conflicts.json'));
@@ -413,6 +434,216 @@ function stop() {
   process.exitCode = blocked === 0 ? 0 : 1;
 }
 
+const TASK_LEVEL_DEFAULTS = {
+  L0: { files: 3, modules: 1, database: false, new_service: false },
+  L1: { files: 10, modules: 2, database: false, new_service: false },
+  L2: { files: 25, modules: 5, database: true, new_service: false },
+  L3: { files: 15, modules: 3, database: false, new_service: false },
+};
+
+const L2_KEYWORDS = /架构|平台|agent\s*os|微服务|新服务|migration|迁移|redesign|从零/i;
+const L3_KEYWORDS = /线上故障|生产事故|incident|紧急回滚|hotfix|告警|宕机|线上\s*问题/i;
+const L0_KEYWORDS = /加字段|改文案|typo|单文件|rename|常量|日志/i;
+
+function readSession() {
+  const p = join(dir, 'session.json');
+  if (!existsSync(p)) return { requirement: '' };
+  try {
+    return JSON.parse(readFileSync(p, 'utf8'));
+  } catch {
+    return { requirement: '' };
+  }
+}
+
+function inferTaskLevel() {
+  const session = readSession();
+  if (session.task_level) {
+    return { level: session.task_level, rationale: session.task_level_rationale || 'session.json 已设定', source: 'session' };
+  }
+  const req = String(session.requirement || '');
+  let riskTotal = 0;
+  const rp = join(dir, 'risk.json');
+  if (existsSync(rp)) {
+    try {
+      const dims = (JSON.parse(readFileSync(rp, 'utf8')).dimensions) || {};
+      riskTotal = RISK_DIMS.reduce((s, k) => s + Number(dims[k]?.score || 0), 0);
+    } catch { /* ignore */ }
+  }
+  if (L3_KEYWORDS.test(req)) return { level: 'L3', rationale: '需求文案命中 incident 信号', source: 'heuristic' };
+  if (L2_KEYWORDS.test(req) || riskTotal >= 15) return { level: 'L2', rationale: riskTotal >= 15 ? `risk 总分 ${riskTotal}` : '需求文案命中 architecture 信号', source: 'heuristic' };
+  if (L0_KEYWORDS.test(req) && riskTotal <= 7) return { level: 'L0', rationale: '简单变更信号 + risk≤7', source: 'heuristic' };
+  return { level: 'L1', rationale: '默认 normal_feature', source: 'heuristic' };
+}
+
+function route() {
+  const inferred = inferTaskLevel();
+  const out = {
+    task_level: inferred.level,
+    rationale: inferred.rationale,
+    source: inferred.source,
+    flow: {
+      skip_review_validate: inferred.level === 'L0',
+      require_change_budget: inferred.level === 'L2' || inferred.level === 'L3',
+      require_evidence_ledger_timeline: inferred.level === 'L3',
+    },
+  };
+  console.log(JSON.stringify(out, null, 2));
+  if (writeFlag) {
+    const session = readSession();
+    session.task_level = inferred.level;
+    session.task_level_rationale = inferred.rationale;
+    session.updated_at = new Date().toISOString();
+    writeJson('session.json', session);
+    console.log('=> 已写入 session.json task_level');
+  }
+}
+
+function budget() {
+  const { level } = inferTaskLevel();
+  const defs = TASK_LEVEL_DEFAULTS[level] || TASK_LEVEL_DEFAULTS.L1;
+  const pick = (name, parser) => {
+    const i = process.argv.indexOf(name);
+    return i >= 0 && process.argv[i + 1] !== undefined ? parser(process.argv[i + 1]) : undefined;
+  };
+  const body = {
+    files: pick('--files', (v) => Number(v)) ?? defs.files,
+    modules: pick('--modules', (v) => Number(v)) ?? defs.modules,
+    database: pick('--database', (v) => v === 'true') ?? defs.database,
+    new_service: pick('--new-service', (v) => v === 'true') ?? defs.new_service,
+    task_level: level,
+    rationale: pick('--rationale', String) ?? `默认预算（${level}）`,
+    updated_at: new Date().toISOString(),
+  };
+  if (writeFlag) {
+    writeJson('change-budget.json', body);
+    console.log(JSON.stringify(body, null, 2));
+    console.log('=> 已写入 change-budget.json');
+  } else {
+    console.log(JSON.stringify(body, null, 2));
+    console.log('=> 预览；确认后加 --write');
+  }
+}
+
+function ledgerCmd() {
+  const sub = process.argv[4];
+  const ledgerPath = join(dir, 'evidence-ledger.json');
+  let ledger = [];
+  if (existsSync(ledgerPath)) {
+    try { ledger = isArr(JSON.parse(readFileSync(ledgerPath, 'utf8'))); } catch { ledger = []; }
+  }
+  if (sub === 'list') {
+    console.log(JSON.stringify(ledger, null, 2));
+    return;
+  }
+  if (sub === 'validate') {
+    let errors = 0;
+    const kinds = ['FACT', 'DECISION', 'TEST', 'RESULT', 'RISK'];
+    for (const e of ledger) {
+      if (!/^EL-\d{3}$/.test(e.id || '')) { console.log(`${e.id || '?'}: id 须 EL-xxx`); errors++; }
+      if (!kinds.includes(e.kind)) { console.log(`${e.id}: kind 无效`); errors++; }
+      if (!String(e.claim || '').trim()) { console.log(`${e.id}: claim 为空`); errors++; }
+      if (['RESULT', 'TEST'].includes(e.kind) && !(Array.isArray(e.evidence_refs) && e.evidence_refs.length)) {
+        console.log(`${e.id}: ${e.kind} 须有 evidence_refs`);
+        errors++;
+      }
+    }
+    console.log(errors === 0 ? '=> ledger 校验通过' : `=> ${errors} 个错误`);
+    process.exitCode = errors === 0 ? 0 : 1;
+    return;
+  }
+  if (sub === 'append') {
+    const claim = process.argv[5];
+    if (!claim) { console.error('用法: ledger append "<claim>" [--kind RESULT] [--refs "a,b"] [--link DEC-001]'); process.exit(2); }
+    const kindIdx = process.argv.indexOf('--kind');
+    const kind = kindIdx >= 0 ? process.argv[kindIdx + 1] : 'RESULT';
+    const refsIdx = process.argv.indexOf('--refs');
+    const refs = refsIdx >= 0 && process.argv[refsIdx + 1]
+      ? process.argv[refsIdx + 1].split(',').map((s) => s.trim()).filter(Boolean)
+      : [];
+    const linkIdx = process.argv.indexOf('--link');
+    const linked = linkIdx >= 0 && process.argv[linkIdx + 1] ? [process.argv[linkIdx + 1]] : [];
+    const id = nextId(ledger, 'EL-');
+    ledger.push({ id, kind, claim: String(claim), evidence_refs: refs, linked_ids: linked, created_at: new Date().toISOString() });
+    writeJson('evidence-ledger.json', ledger);
+    console.log(`${id} appended`);
+    return;
+  }
+  console.error('用法: ledger list|validate|append "<claim>" [...]');
+  process.exit(2);
+}
+
+function impactGraph() {
+  const decisions = isArr(read('decisions.json'));
+  const graph = decisions.map((d) => ({
+    decision_id: d.id,
+    decision: d.decision,
+    status: d.status,
+    superseded_by: d.status === 'SUPERSEDED' ? d.replaced_by || null : null,
+    impact: {
+      modules: d.impact_scope?.modules || [],
+      files: d.impact_scope?.files || [],
+      tests: d.impact_scope?.tests || [],
+      legacy: Array.isArray(d.impact) ? d.impact : [],
+    },
+  }));
+  if (writeFlag) {
+    writeJson('decision-graph.json', graph);
+    console.log(JSON.stringify(graph, null, 2));
+    console.log('=> 已写入 decision-graph.json');
+  } else {
+    console.log(JSON.stringify(graph, null, 2));
+    console.log('=> 预览；确认后加 --write');
+  }
+}
+
+function exportContext() {
+  const session = readSession();
+  const { level } = inferTaskLevel();
+  const facts = isArr(read('facts.json')).map((f) => `${f.id}: ${f.statement} (${f.source?.path || ''}${f.source?.line ? `:${f.source.line}` : ''})`);
+  const questions = isArr(read('questions.json'));
+  const unknowns = questions.filter((q) => q.status === 'OPEN').map((q) => `${q.id}: ${q.question}`);
+  const decisions = isArr(read('decisions.json'))
+    .filter((d) => d.status === 'FROZEN')
+    .map((d) => ({ id: d.id, decision: d.decision, status: d.status }));
+  const assumptions = isArr(read('assumptions.json'));
+  const risks = assumptions.filter((a) => a.status === 'UNVERIFIED').map((a) => `${a.id} [${a.risk}]: ${a.statement}`);
+  const ledger = existsSync(join(dir, 'evidence-ledger.json')) ? isArr(read('evidence-ledger.json')) : [];
+  const evidence = ledger.map((e) => ({ claim: e.claim, refs: e.evidence_refs || [] }));
+  const constraints = isArr(read('facts.json'))
+    .filter((f) => f.category === 'constraint')
+    .map((f) => f.statement);
+  let change_budget;
+  const bp = join(dir, 'change-budget.json');
+  if (existsSync(bp)) {
+    try { change_budget = JSON.parse(readFileSync(bp, 'utf8')); } catch { /* */ }
+  }
+  const gatePath = join(dir, 'gate.json');
+  let next_action = '继续 RequirementMind 流程';
+  if (existsSync(gatePath)) {
+    try {
+      const g = JSON.parse(readFileSync(gatePath, 'utf8'));
+      if (g.status === 'READY_FOR_DEVELOPMENT') next_action = '导出 agent-prompt，进入 /ai-code';
+    } catch { /* */ }
+  }
+  const doc = {
+    contract_version: 1,
+    session_id: session.id || undefined,
+    task_level: session.task_level || level,
+    goal: session.requirement || '',
+    facts,
+    unknowns,
+    decisions,
+    constraints,
+    risks,
+    evidence,
+    next_action,
+    change_budget: change_budget
+      ? { files: change_budget.files, modules: change_budget.modules, database: change_budget.database, new_service: change_budget.new_service }
+      : undefined,
+  };
+  console.log(JSON.stringify(doc, null, 2));
+}
+
 function evalMetrics() {
   const questions = isArr(read('questions.json'));
   const decisions = isArr(read('decisions.json'));
@@ -442,4 +673,20 @@ function evalMetrics() {
   console.log(JSON.stringify(m, null, 2));
 }
 
-({ counters, frontier, freeze, risk, stop, eval: evalMetrics, validate, gate, snapshot, migrate: migrateQuestions })[cmd]();
+({
+  counters,
+  frontier,
+  freeze,
+  risk,
+  stop,
+  eval: evalMetrics,
+  validate,
+  gate,
+  snapshot,
+  migrate: migrateQuestions,
+  route,
+  budget,
+  ledger: ledgerCmd,
+  'impact-graph': impactGraph,
+  context: exportContext,
+})[cmd]();
