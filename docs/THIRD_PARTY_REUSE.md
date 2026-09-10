@@ -11,6 +11,7 @@
 | Superpowers | **未下载** | — | 开发前强制理解需求 / Hard Gate / 一次一个核心问题 / A-D 选项规则，按已知内容写入 references/grilling.md | — | 如需精确对齐，后补下载后更新本表与 grilling.md |
 
 本地对照参考（非外部项目）：
-- `~/.zcode/skills/grilling`（本地 grilling skill）— 每轮回答后重算 frontier 的思想，被 R6 吸收；其"整轮 frontier 一起问"模式被有意改为"一次一个 BLOCKING 问题"（见 REQUIREMENTS.md F3）。
+- `~/.zcode/skills/grilling`（本地 grilling skill）— 设计树/frontier 模型已完整吸收：整轮 frontier 一起问（Phase 3 批量模式）、每轮回答后重算 frontier（R6）、事实自己查不问用户（R3）+ 取证并行不阻塞整批。决策格式保留 A-D 选项 + ⭐ 推荐 + 冻结语义（本地增强）。
+- `RequirementMind_Ultimate 设计文档（内部，2026-09）` — 吸收：Risk Router 分层审查、Human-Only Decision Gate（authority）、Evidence Pack 紧凑输出、Stop Rule、Question Value Score、Eval 闭环；**未采纳**：固定多 Agent 委员会全量讨论（以 LIGHT/FOCUSED/COUNCIL 分层路由替代，见 references/risk-router.md）。
 
 登记时间：2026-08-30。若未来引入任何外部代码/依赖，必须先更新本表（版本、commit、修改原因）。

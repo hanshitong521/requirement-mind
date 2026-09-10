@@ -48,6 +48,9 @@ requirement-mind/
 │   ├── parser.md            # KNOWN/UNKNOWN/CONFLICT/ASSUMPTION 拆分规则
 │   ├── grilling.md          # 提问规范、优先级、停止条件
 │   ├── freezer.md           # 冻结/supersede 规则
+│   ├── risk-router.md       # 八维风险评分与审查分层（LIGHT/FOCUSED/COUNCIL）
+│   ├── specialists.md       # 专项 Reviewer prompt 片段（security/data/concurrency/compat/testability）
+│   ├── eval.md              # Eval 闭环：指标、回填字段与策略阈值
 │   ├── reviewer.md          # Adversarial Reviewer 独立上下文 System Prompt
 │   ├── validator.md         # Evidence Validator 独立上下文 System Prompt
 │   ├── spec-compiler.md     # DEVELOPMENT_SPEC.md 生成规则
@@ -57,7 +60,9 @@ requirement-mind/
 │   └── agent-prompt.md      # 导出 prompt 模板（generic / codex / cursor / claude-code）
 ├── schemas/                 # *.json 数据模型定义（facts/questions/decisions/…）
 ├── scripts/
-│   └── state.js (或 sh)     # 确定性辅助：校验 JSON、统计 blocking 计数、Gate 汇总
+│   ├── state.mjs            # 确定性辅助：frontier 批量输出、freeze 冻结、JSON 校验、blocking 计数、Gate、快照、migrate（旧 questions 补推荐字段）
+│   ├── selftest.mjs         # mock 会话确定性自测（46 项断言 + 每轮读取开销计量）
+│   └── fixtures/            # mock 会话（红包限时领取场景）+ 旧版 questions 迁移样例
 └── docs/
     └── THIRD_PARTY_REUSE.md # 外部项目复用记录
 ```
@@ -67,11 +72,12 @@ requirement-mind/
 ```
 用户需求（一句话）
   ↓ Phase 1  Context Scanner      扫描目标项目 → PROJECT_FACTS + facts.json
-  ↓ Phase 2  Requirement Parser   拆分 KNOWN / UNKNOWN / CONFLICT / ASSUMPTION
-  ↓ Phase 3  Grilling Engine      循环：选最高价值 BLOCKING 问题 → 一次一个 →
-  │                               用户回答 → 冻结 → 重新推演全需求 → 发现下一层问题
+  ↓ Phase 2  Requirement Parser   拆分 KNOWN / UNKNOWN / CONFLICT / ASSUMPTION（问题标 authority/value）
+  ↓ Phase 2.5 Risk Router         八维评分 → LIGHT/FOCUSED/COUNCIL 分层，决定审查投入
+  ↓ Phase 3  Grilling Engine      循环：frontier 取本批（仅 USER_ONLY）→ 整批抛出 →
+  │                               用户回答 → freeze 冻结（TECHNICAL/LOW 走 --auto 自治）→ 全量重推演
   ↓ Phase 4  Spec Compiler        生成初步 DEVELOPMENT_SPEC.md
-  ↓ Phase 5  Adversarial Review   独立上下文 subagent 攻击规格（只输出 CLAIM）
+  ↓ Phase 5  Adversarial Review   独立上下文 subagent 攻击规格（Evidence Pack 紧凑块；FOCUSED/COUNCIL 加专项）
   ↓ Phase 6  Evidence Validator   独立上下文 subagent 逐条二次验证
   │                               → CONFIRMED / PLAUSIBLE / REFUTED
   │        CONFIRMED 的高危问题 → 转为 BLOCKING 问题，回到 Phase 3 重新追问
@@ -102,14 +108,15 @@ requirement-mind/
   - **UNKNOWN**：项目查不到的业务规则（如到期行为、幂等语义、权限归属）
   - **CONFLICT**：需求与代码/文档现状矛盾（如 status=2 旧代码已有含义）
   - **ASSUMPTION**：模型推断，标注 risk（HIGH 的 assumption 禁止进入最终规格）
+- 每条 UNKNOWN 生成的 question 必须标 `authority`（USER_ONLY=业务取舍须问用户 / TECHNICAL=纯工程选择 AI 自治，R11）与 `value`（HIGH/MEDIUM/LOW，价值分 = 决策影响 × 不确定度 × 错误代价 ÷ 获取成本）。
 - 每轮追问后**全量重新解析**，不允许只增量补丁。
 
 ### F3 Grilling Engine（Phase 3）
 
 - 问题分级：**BLOCKING**（状态机、身份定义、金额计算、并发、幂等、权限、删除语义、核心异常）> **IMPORTANT**（改变体验/结构）> **OPTIONAL**（可用明确默认值，不问）。
-- 每个问题固定格式：一句话问题 + 一句话"为什么必须确认" + 2~5 个 A/B/C/D 选项；禁止长篇背景、禁止"还有补充吗"式空问题。
-- 一次只问一个 BLOCKING 问题；回答后冻结并重新推演。
-- 停止条件（R9）：三类关键计数全部为 0。
+- 每个问题固定格式：一句话问题 + 一句话"为什么必须确认" + 2~5 个 A/B/C/D 选项 + **必须**标明推荐项（`⭐ 推荐：X`）+ 一句话推荐理由（可引用 facts）；禁止长篇背景、禁止"还有补充吗"式空问题。
+- 每轮整批抛出当前 frontier（仅 **USER_ONLY** 的 BLOCKING+IMPORTANT + OPEN 冲突；TECHNICAL/LOW 值问题 AI 自治裁决 `freeze --auto`；选项依赖未答问题的归下一轮；取证并行不阻塞整批）；回答后 `state.mjs freeze` 冻结并全量重推演。
+- 停止条件（R9 + 覆盖率）：`state.mjs stop` 退出码 0（关键计数清零 + risk 高分维度证据可解析）；此后禁止追加提问（R12）。
 
 ### F4 Decision Freezer（Phase 3 内）
 
@@ -146,13 +153,25 @@ requirement-mind/
 - 把 READY 的 DEVELOPMENT_SPEC.md 转成各 Agent 最优执行 prompt：generic（默认）、codex、cursor、claude-code，输出到 `.agent-prompts/`。
 - 内含开发 Agent 行为约束：允许自定技术细节/局部重构/补测试；禁止改冻结规则、状态语义、权限、验收口径。
 
+### F10 Risk Router（Phase 2.5）
+
+- 八维风险评分（business_criticality / data_impact / concurrency_risk / security_risk / compatibility_risk / irreversibility / blast_radius / evidence_gap，各 0-3）落盘 `risk.json`；score>=2 必须带 FACT/CON/DEC 证据 refs（`stop` 做可解析校验）。
+- `state.mjs risk` 分层：LIGHT 0-7 = 主 Agent+Reviewer+Validator；FOCUSED 8-14 = +1 名专项（specialists.md 按最高分维度路由）；COUNCIL 15-24 = +至多 3 名专项且全部 BLOCKING CLAIM 过 Validator。**80% 需求应停在 LIGHT。**
+
+### F11 Eval 闭环（收尾 + Phase 8 后）
+
+- `state.mjs eval` 输出会话指标（自治率、Reviewer 验真率、快照轮次）→ 存 `eval.json`；Phase 8 后回填 missed_requirements / rework_count / not_ask_me。
+- 按 references/eval.md 阈值表驱动下次会话策略：authority 松紧、Reviewer confidence 校准、扫描维度扩缩。
+
 ## 7. 数据模型（.requirementmind/）
 
 ```
 session.json     会话与阶段游标（支持中断恢复）
 facts.json       FACT-xxx：statement / source{type,path,line} / confidence / status
-questions.json   Q-xxx：topic / question / reason / priority(BLOCKING|IMPORTANT|OPTIONAL) / options / status
-decisions.json   DEC-xxx：question_id / decision / source / status(FROZEN|SUPERSEDED) / replaced_by
+questions.json   Q-xxx：topic / question / reason / priority(BLOCKING|IMPORTANT|OPTIONAL) / options / recommended_option(A-D) / recommendation_reason / authority(USER_ONLY|TECHNICAL) / value(HIGH|MEDIUM|LOW) / status
+decisions.json   DEC-xxx：question_id / decision / source(USER|AI_DEFAULT) / status(FROZEN|SUPERSEDED) / replaced_by / basis
+risk.json        八维评分 dimensions{score,refs} / total / tier(LIGHT|FOCUSED|COUNCIL) / specialists（Phase 2.5）
+eval.json        会话指标 + 开发后回填（missed_requirements / rework_count / not_ask_me）
 assumptions.json ASM-xxx：statement / risk(HIGH|MEDIUM|LOW) / source=MODEL_INFERENCE / status
 conflicts.json   CON-xxx：left / right / severity / status
 challenges.json  CH-xxx：claim / challenge / evidence[] / status(PENDING_VALIDATION|…)
