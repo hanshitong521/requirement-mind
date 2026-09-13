@@ -7,11 +7,11 @@ import { join } from 'node:path';
 
 const cmd = process.argv[2];
 const dir = process.argv[3];
-if (!dir || !['counters', 'frontier', 'freeze', 'risk', 'stop', 'eval', 'validate', 'gate', 'snapshot', 'migrate', 'route', 'budget', 'ledger', 'impact-graph', 'context'].includes(cmd)) {
-  console.error('用法: node state.mjs <counters|frontier|freeze|risk|stop|eval|validate|gate|snapshot|migrate|route|budget|ledger|impact-graph|context> <.requirementmind 目录> [参数]');
+if (!dir || !['counters', 'frontier', 'freeze', 'risk', 'stop', 'eval', 'validate', 'gate', 'snapshot', 'migrate', 'route', 'budget', 'ledger', 'impact-graph', 'context', 'ir', 'gate-state', 'evidence-pack', 'decision-memory'].includes(cmd)) {
+  console.error('用法: node state.mjs <counters|frontier|freeze|risk|stop|eval|validate|gate|snapshot|migrate|route|budget|ledger|impact-graph|context|ir|gate-state|evidence-pack|decision-memory> <.requirementmind 目录> [参数]');
   console.error('  frontier : 输出当前待问批量（OPEN 的 USER_ONLY BLOCKING+IMPORTANT + OPEN 冲突）与计数；TECHNICAL 不问用户');
   console.error('  freeze   : freeze <dir> <Q-xxx|CON-xxx> "<选项字母或决定文本>" [--supersede] [--auto] [--impact "a,b"] — 冻结为 DEC（--auto=AI 自治裁决）');
-  console.error('  risk     : 校验 risk.json 八维评分 → 分层 LIGHT/FOCUSED/COUNCIL + 指定专项 Reviewer');
+  console.error('  risk     : 校验 risk.json 八维评分 → 分层 LIGHT/FOCUSED/COUNCIL + 派专家（COUNCIL=五专家强制）');
   console.error('  stop     : 停止条件判定（R9 + 风险维度证据覆盖率）；退出码 0 = 收敛，禁止继续追问/审查');
   console.error('  eval     : 会话指标（用户自治率 / Reviewer 验真率 / 轮次），供 Eval 闭环');
   console.error('  route    : Complexity Router → task_level L0–L3 [--write]');
@@ -19,6 +19,10 @@ if (!dir || !['counters', 'frontier', 'freeze', 'risk', 'stop', 'eval', 'validat
   console.error('  ledger   : ledger list|validate|append <claim> [--kind KIND] [--refs "a,b"] [--link DEC-001]');
   console.error('  impact-graph : 从 decisions 生成 decision-graph.json [--write]');
   console.error('  context  : 导出 Decision Context Contract JSON（stdout）');
+  console.error('  ir            : 从 canonical JSON 单向生成 Requirement IR 7 文件（ir/requirement.yaml 等），供 Coding/Project-Brain/ContextMind/TestMind 消费');
+  console.error('  gate-state    : 输出 Gate 状态机当前节点 + 迁移历史；gate-state --record --to FROZEN 记录状态迁移');
+  console.error('  evidence-pack : 聚合 facts/decisions/challenges/evidence-ledger → 统一四元组（结论/证据/可信度/验证方式）');
+  console.error('  decision-memory: 聚合 decisions + history/ → decision-memory.json（带 rejected_alternatives / failure_history）');
   process.exit(2);
 }
 const writeFlag = process.argv.includes('--write');
@@ -381,11 +385,19 @@ function risk() {
   const ranked = RISK_DIMS.map((k) => [k, Number(dims[k].score)]).sort((a, b) => b[1] - a[1]);
   const specialists = [];
   if (tier !== 'LIGHT') {
+    // V5：COUNCIL 必须派满 5 专家委员会（按风险分数从高到低，最多 5 个不同维度映射）
+    const cap = tier === 'COUNCIL' ? COUNCIL_FIVE.length : 1;
     for (const [k, s] of ranked) {
-      if (specialists.length >= (tier === 'COUNCIL' ? 3 : 1)) break;
-      if (s < 2) break;
+      if (specialists.length >= cap) break;
+      if (tier === 'FOCUSED' && s < 2) break;
       const sp = SPECIALIST_FOR[k];
       if (sp && !specialists.includes(sp)) specialists.push(sp);
+    }
+    // V5：COUNCIL 必须补齐所有 5 专家（即使 score<2，按 ZERO_BUT_REQUIRED 标注）
+    if (tier === 'COUNCIL') {
+      for (const sp of COUNCIL_FIVE) {
+        if (!specialists.includes(sp)) specialists.push(sp);
+      }
     }
   }
   console.log(JSON.stringify({ total, tier, specialists, top_dims: ranked.filter(([, s]) => s >= 2) }, null, 2));
@@ -393,7 +405,15 @@ function risk() {
     ? '=> LIGHT：现有轻量流程（主 Agent + Reviewer + Validator），禁止追加角色'
     : tier === 'FOCUSED'
       ? '=> FOCUSED：现有流程 + 1 名专项 Reviewer（references/specialists.md 对应节）'
-      : '=> COUNCIL：现有流程 + 至多 3 名专项 Reviewer，全部 BLOCKING CLAIM 必须过 Validator');
+      : `=> COUNCIL：五专家委员会强制派发（${specialists.join(' / ')}），全部 BLOCKING CLAIM 必须过 Validator`);
+  if (writeFlag) {
+    r.total = total;
+    r.tier = tier;
+    r.specialists = specialists;
+    r.updated_at = new Date().toISOString();
+    writeJson('risk.json', r);
+    console.log('=> 已写回 risk.json（tier/specialists）');
+  }
 }
 
 function stop() {
@@ -673,6 +693,428 @@ function evalMetrics() {
   console.log(JSON.stringify(m, null, 2));
 }
 
+// ========================================================================
+// Requirement IR（V5 P0）：从 canonical JSON 单向生成 7 个 IR 文件
+//   ir/requirement.yaml  业务需求（goal + scope + out_of_scope）
+//   ir/business-rule.yaml 业务规则（每条带 DEC id）
+//   ir/workflow.yaml      业务流程（state machine + 触发器）
+//   ir/risk.yaml          风险评分 + 专家路由
+//   ir/acceptance.yaml    验收标准（criteria + required tests）
+//   ir/decision.json      决策（含 rejected_alternatives / failure_history）
+//   ir/trace.json         追溯链（FACT → DEC → SPEC 章节）
+// 原则：JSON → IR 单向，禁止反向。R10：每个 IR 文件对"完全不了解对话历史的 Agent"自足。
+// ========================================================================
+const COUNCIL_FIVE = ['concurrency', 'data_integrity', 'security', 'compatibility', 'testability'];
+
+function yamlEscape(v) {
+  if (v === null || v === undefined) return '""';
+  const s = String(v);
+  if (/[:#\n"'>&*?|%@`{}[\],\n]/.test(s) || /^\s|\s$/.test(s)) {
+    return JSON.stringify(s);
+  }
+  return s;
+}
+
+function yamlList(arr, indent = 0) {
+  const pad = ' '.repeat(indent);
+  return (arr || []).map((x) => `${pad}- ${yamlEscape(x)}`).join('\n');
+}
+
+function toYamlRequirement(session, decisions, scope, oos) {
+  const title = session.requirement || '';
+  return [
+    '# Generated by RequirementMind state.mjs ir — DO NOT EDIT',
+    `# source_session: ${session.id || '(unnamed)'}`,
+    `# generated_at: ${new Date().toISOString()}`,
+    'requirement:',
+    `  title: ${yamlEscape(title)}`,
+    `  task_level: ${yamlEscape(session.task_level || 'L1')}`,
+    `  status: ${yamlEscape(session.phase || 'INPUT')}`,
+    'scope:',
+    yamlList(scope, 2),
+    'out_of_scope:',
+    yamlList(oos, 2),
+  ].join('\n') + '\n';
+}
+
+function toYamlBusinessRules(decisions) {
+  const frozen = decisions.filter((d) => d.status === 'FROZEN');
+  const lines = [
+    '# Generated by RequirementMind state.mjs ir — DO NOT EDIT',
+    `# generated_at: ${new Date().toISOString()}`,
+    `# total_rules: ${frozen.length}`,
+    'rules:',
+  ];
+  for (const d of frozen) {
+    lines.push(`  - id: ${d.id}`);
+    lines.push(`    topic: ${yamlEscape(d.topic || '')}`);
+    lines.push(`    rule: ${yamlEscape(d.decision)}`);
+    lines.push(`    source: ${d.source}`);
+    lines.push(`    basis: ${yamlEscape(d.basis || `question ${d.question_id}`)}`);
+    if (Array.isArray(d.impact) && d.impact.length) lines.push(`    impact:\n${yamlList(d.impact, 6)}`);
+    if (Array.isArray(d.rejected_alternatives) && d.rejected_alternatives.length) {
+      lines.push(`    rejected_alternatives:`);
+      for (const r of d.rejected_alternatives) {
+        lines.push(`      - option: ${yamlEscape(r.option || '')}`);
+        lines.push(`        reason: ${yamlEscape(r.reason || '')}`);
+      }
+    }
+  }
+  return lines.join('\n') + '\n';
+}
+
+function toYamlWorkflow(decisions, assumptions) {
+  const stateDecs = decisions.filter((d) => d.status === 'FROZEN' && /state|status|状态|workflow|流程|state_machine/i.test(`${d.topic} ${d.decision}`));
+  const lines = [
+    '# Generated by RequirementMind state.mjs ir — DO NOT EDIT',
+    `# generated_at: ${new Date().toISOString()}`,
+    'states:',
+  ];
+  if (!stateDecs.length) {
+    lines.push('  - 未识别到状态机相关冻结决策；状态机由 Coding Agent 按业务规则推导');
+  }
+  for (const d of stateDecs) {
+    lines.push(`  - id: ${d.id}`);
+    lines.push(`    name: ${yamlEscape(d.topic)}`);
+    lines.push(`    trigger: ${yamlEscape(d.decision)}`);
+  }
+  lines.push('assumptions_about_flow:');
+  for (const a of assumptions.filter((x) => x.risk !== 'LOW').slice(0, 10)) {
+    lines.push(`  - id: ${a.id}`);
+    lines.push(`    statement: ${yamlEscape(a.statement)}`);
+    lines.push(`    risk: ${a.risk}`);
+  }
+  return lines.join('\n') + '\n';
+}
+
+function toYamlRisk(risk) {
+  const dims = (risk && risk.dimensions) || {};
+  const lines = [
+    '# Generated by RequirementMind state.mjs ir — DO NOT EDIT',
+    `# generated_at: ${new Date().toISOString()}`,
+    `# total: ${risk?.total ?? 0}`,
+    `# tier: ${risk?.tier ?? 'LIGHT'}`,
+    `# specialists: ${(risk?.specialists || []).join(',') || '(none — LIGHT)'}`,
+    'dimensions:',
+  ];
+  for (const k of RISK_DIMS) {
+    const d = dims[k] || { score: 0, refs: [] };
+    lines.push(`  - key: ${k}`);
+    lines.push(`    score: ${d.score}`);
+    lines.push(`    refs:`);
+    for (const r of (d.refs || [])) lines.push(`      - ${yamlEscape(r)}`);
+  }
+  return lines.join('\n') + '\n';
+}
+
+function toYamlAcceptance(decisions, questions, gate) {
+  const lines = [
+    '# Generated by RequirementMind state.mjs ir — DO NOT EDIT',
+    `# generated_at: ${new Date().toISOString()}`,
+    'criteria:',
+  ];
+  if (gate && gate.status === 'READY_FOR_DEVELOPMENT') {
+    lines.push('  - id: GATE-READY');
+    lines.push('    rule: 硬门槛（blocking_questions/blocking_conflicts/critical_assumptions/unvalidated_high_risks）= 0');
+    lines.push('    source: gate.json');
+  } else {
+    lines.push('  - id: GATE-BLOCKED');
+    lines.push('    rule: 任一硬门槛 > 0；以下为已知未答问题');
+  }
+  for (const q of questions.filter((x) => x.priority === 'BLOCKING' && x.status === 'OPEN')) {
+    lines.push(`  - id: ${q.id}`);
+    lines.push(`    rule: ${yamlEscape(q.question)}`);
+    lines.push('    source: questions.json');
+    lines.push('    status: BLOCKING');
+  }
+  lines.push('required_tests:');
+  lines.push('  - kind: unit');
+  lines.push('    target: 冻结规则对应路径（见 ir/decision.json impact_scope）');
+  return lines.join('\n') + '\n';
+}
+
+function toDecisionJson(decisions) {
+  return JSON.stringify(
+    {
+      contract_version: 1,
+      generated_at: new Date().toISOString(),
+      total: decisions.length,
+      frozen: decisions.filter((d) => d.status === 'FROZEN').map((d) => ({
+        id: d.id,
+        topic: d.topic,
+        decision: d.decision,
+        source: d.source,
+        basis: d.basis,
+        impact: d.impact || [],
+        impact_scope: d.impact_scope || null,
+        rejected_alternatives: d.rejected_alternatives || [],
+        created_at: d.created_at,
+      })),
+      superseded: decisions
+        .filter((d) => d.status === 'SUPERSEDED')
+        .map((d) => ({ id: d.id, replaced_by: d.replaced_by })),
+    },
+    null,
+    2,
+  ) + '\n';
+}
+
+function toTraceJson(facts, decisions) {
+  const knownFacts = new Set(facts.map((f) => f.id));
+  const trace = [];
+  for (const d of decisions.filter((x) => x.status === 'FROZEN')) {
+    const basis = d.basis || d.question_id || '';
+    const refs = [];
+    for (const token of String(basis).split(/[\s,;]+/)) {
+      if (knownFacts.has(token)) refs.push(token);
+    }
+    trace.push({ decision_id: d.id, topic: d.topic, evidence_refs: refs, basis });
+  }
+  return JSON.stringify({ contract_version: 1, generated_at: new Date().toISOString(), trace }, null, 2) + '\n';
+}
+
+function deriveScopeOOS(decisions, assumptions) {
+  const scope = [];
+  for (const d of decisions.filter((x) => x.status === 'FROZEN').slice(0, 8)) {
+    scope.push(`${d.id}: ${d.topic} — ${d.decision}`);
+  }
+  if (!scope.length) scope.push('未识别到冻结决策；scope 由 Coding Agent 按业务规则推导');
+  const oos = [
+    '禁止修改 FROZEN 决策的任何字段（decisions.json / 规格 Frozen Business Rules 章节）',
+    '禁止新增业务含义或默认值',
+    '禁止修改数据库语义、状态含义、权限规则、验收口径',
+    'Coding Agent 自定技术细节/局部重构/补测试允许',
+  ];
+  return { scope, oos };
+}
+
+function exportIR() {
+  const session = readSession();
+  const facts = isArr(read('facts.json'));
+  const questions = isArr(read('questions.json'));
+  const decisions = isArr(read('decisions.json'));
+  const assumptions = isArr(read('assumptions.json'));
+  let risk = null;
+  const rp = join(dir, 'risk.json');
+  if (existsSync(rp)) {
+    try { risk = JSON.parse(readFileSync(rp, 'utf8')); } catch { /* */ }
+  }
+  let gate = null;
+  const gp = join(dir, 'gate.json');
+  if (existsSync(gp)) {
+    try { gate = JSON.parse(readFileSync(gp, 'utf8')); } catch { /* */ }
+  }
+  const { scope, oos } = deriveScopeOOS(decisions, assumptions);
+  const irDir = join(dir, 'ir');
+  if (writeFlag && !existsSync(irDir)) mkdirSync(irDir, { recursive: true });
+  const files = {
+    'requirement.yaml': toYamlRequirement(session, decisions, scope, oos),
+    'business-rule.yaml': toYamlBusinessRules(decisions),
+    'workflow.yaml': toYamlWorkflow(decisions, assumptions),
+    'risk.yaml': toYamlRisk(risk),
+    'acceptance.yaml': toYamlAcceptance(decisions, questions, gate),
+    'decision.json': toDecisionJson(decisions),
+    'trace.json': toTraceJson(facts, decisions),
+  };
+  if (!writeFlag) {
+    console.log(`# IR 预览（${Object.keys(files).length} 文件，--write 写入 ${irDir}）\n`);
+    for (const [name, body] of Object.entries(files)) {
+      console.log(`--- ${name} ---`);
+      console.log(body);
+    }
+    return;
+  }
+  for (const [name, body] of Object.entries(files)) {
+    writeFileSync(join(irDir, name), body);
+    console.log(`写入 ${join('ir', name)} (${Buffer.byteLength(body, 'utf8')}B)`);
+  }
+  console.log(`\n=> Requirement IR 已生成（7 文件）。下游消费者：Coding Agent / Project-Brain / ContextMind / TestMind`);
+}
+
+// ========================================================================
+// Gate 状态机（V5 P0）：INPUT → ANALYZING → BLOCKED → READY_FOR_DEVELOPMENT → FROZEN
+// 输出当前节点 + 迁移历史；--record --to <NODE> 记录迁移。
+// ========================================================================
+const GATE_NODES = ['INPUT', 'ANALYZING', 'BLOCKED', 'READY_FOR_DEVELOPMENT', 'FROZEN'];
+const GATE_TRANSITIONS = {
+  INPUT: ['ANALYZING'],
+  ANALYZING: ['BLOCKED', 'READY_FOR_DEVELOPMENT'],
+  BLOCKED: ['ANALYZING'],
+  READY_FOR_DEVELOPMENT: ['FROZEN', 'BLOCKED'],
+  FROZEN: ['BLOCKED'],
+};
+
+function gateStateCmd() {
+  const session = readSession();
+  const idx = process.argv.indexOf('--to');
+  const recordTo = idx >= 0 ? process.argv[idx + 1] : null;
+  const history = Array.isArray(session.gate_state_history) ? session.gate_state_history : [];
+  const current = (() => {
+    if (GATE_NODES.includes(session.phase)) return session.phase;
+    if (session.phase === 'READY' || session.phase === 'GATED') return 'READY_FOR_DEVELOPMENT';
+    if (session.phase === 'GRILLING' || session.phase === 'SCANNED' || session.phase === 'PARSED') return 'ANALYZING';
+    return 'INPUT';
+  })();
+  if (recordTo) {
+    if (!GATE_NODES.includes(recordTo)) {
+      console.error(`gate-state: --to 必须是 ${GATE_NODES.join('|')}`);
+      process.exit(2);
+    }
+    const allowed = GATE_TRANSITIONS[current] || [];
+    if (!allowed.includes(recordTo)) {
+      console.error(`gate-state: 非法迁移 ${current} → ${recordTo}（允许: ${allowed.join(',')}）`);
+      process.exit(1);
+    }
+    history.push({ from: current, to: recordTo, at: new Date().toISOString(), reason: process.argv.includes('--reason') ? process.argv[process.argv.indexOf('--reason') + 1] : '' });
+    session.gate_state_history = history;
+    session.phase = recordTo;
+    session.updated_at = new Date().toISOString();
+    writeJson('session.json', session);
+    console.log(`gate-state: ${current} → ${recordTo}（已记录）`);
+    return;
+  }
+  const out = {
+    current,
+    allowed_next: GATE_TRANSITIONS[current] || [],
+    history,
+    counter_snapshot: countersData(),
+  };
+  console.log(JSON.stringify(out, null, 2));
+}
+
+// ========================================================================
+// Evidence Engine（V5 P1）：聚合 facts/decisions/challenges/evidence-ledger
+//   → 统一四元组（结论/证据/可信度/验证方式）
+//   写到 .requirementmind/evidence-pack.json（--write）或 stdout（预览）
+// ========================================================================
+function evidencePack() {
+  const facts = isArr(read('facts.json'));
+  const decisions = isArr(read('decisions.json'));
+  const challenges = isArr(read('challenges.json'));
+  const evidence = isArr(read('evidence.json'));
+  const ledger = existsSync(join(dir, 'evidence-ledger.json')) ? isArr(read('evidence-ledger.json')) : [];
+  const verdictMap = new Map(evidence.map((e) => [e.challenge_id, e]));
+  const items = [];
+  for (const f of facts) {
+    items.push({
+      kind: 'FACT',
+      id: f.id,
+      conclusion: f.statement,
+      evidence: f.source ? [`${f.source.type}:${f.source.path}${f.source.line ? ':' + f.source.line : ''}`] : [],
+      confidence: typeof f.confidence === 'number' ? f.confidence : null,
+      verification: f.source ? `grep -n "${(f.statement || '').slice(0, 30)}" ${f.source.path}` : null,
+    });
+  }
+  for (const d of decisions.filter((x) => x.status === 'FROZEN')) {
+    items.push({
+      kind: 'DECISION',
+      id: d.id,
+      conclusion: d.decision,
+      evidence: d.basis ? [d.basis] : (d.question_id ? [d.question_id] : []),
+      confidence: d.source === 'AI_DEFAULT' ? 0.6 : 0.9,
+      verification: Array.isArray(d.impact) && d.impact.length ? `trace impact → ${d.impact.join(', ')}` : null,
+      source: d.source,
+    });
+  }
+  for (const c of challenges) {
+    const ev = verdictMap.get(c.id);
+    items.push({
+      kind: 'CHALLENGE',
+      id: c.id,
+      conclusion: c.claim,
+      evidence: c.evidence || [],
+      confidence: ev && typeof ev.confidence === 'number' ? ev.confidence : null,
+      verification: c.validation || null,
+      status: ev ? ev.verdict : c.status,
+      severity: c.severity,
+    });
+  }
+  for (const e of ledger) {
+    items.push({
+      kind: 'LEDGER',
+      id: e.id,
+      conclusion: e.claim,
+      evidence: e.evidence_refs || [],
+      confidence: null,
+      verification: null,
+      kind_sub: e.kind,
+    });
+  }
+  const summary = {
+    total: items.length,
+    by_kind: items.reduce((acc, it) => {
+      acc[it.kind] = (acc[it.kind] || 0) + 1;
+      return acc;
+    }, {}),
+    by_status: items.reduce((acc, it) => {
+      const k = it.status || (it.kind === 'FACT' ? 'VERIFIED' : it.kind === 'DECISION' ? 'FROZEN' : 'PENDING');
+      acc[k] = (acc[k] || 0) + 1;
+      return acc;
+    }, {}),
+  };
+  const out = { contract_version: 1, generated_at: new Date().toISOString(), summary, items };
+  if (writeFlag) {
+    writeJson('evidence-pack.json', out);
+    console.log(JSON.stringify({ written: 'evidence-pack.json', ...summary }, null, 2));
+  } else {
+    console.log(JSON.stringify(out, null, 2));
+  }
+}
+
+// ========================================================================
+// Decision Memory（V5 P1）：聚合 decisions + history/ → decision-memory.json
+//   包含 rejected_alternatives（来自当前 decision.rejected_alternatives）
+//   + failure_history（来自 history/ 各快照中 status=SUPERSEDED 的决策原因）
+// ========================================================================
+function decisionMemory() {
+  const decisions = isArr(read('decisions.json'));
+  const historyDir = join(dir, 'history');
+  const failureHistory = [];
+  if (existsSync(historyDir)) {
+    for (const snapName of readdirSync(historyDir).sort()) {
+      try {
+        const snap = JSON.parse(readFileSync(join(historyDir, snapName), 'utf8'));
+        // snapshot 文件结构：{ "session.json": {...}, "decisions.json": [...], ... }
+        const snapDecisions = Array.isArray(snap) ? snap : (snap['decisions.json'] || snap.decisions || []);
+        for (const d of snapDecisions) {
+          if (d.status === 'SUPERSEDED' && d.replaced_by) {
+            failureHistory.push({
+              at: snapName,
+              decision_id: d.id,
+              summary: `${d.topic}: ${d.decision} → 被 ${d.replaced_by} supersede`,
+              evidence_refs: d.basis ? [d.basis] : (d.question_id ? [d.question_id] : []),
+            });
+          }
+        }
+      } catch { /* skip corrupt snapshot */ }
+    }
+  }
+  const memory = {
+    contract_version: 1,
+    generated_at: new Date().toISOString(),
+    total_decisions: decisions.length,
+    frozen: decisions
+      .filter((d) => d.status === 'FROZEN')
+      .map((d) => ({
+        id: d.id,
+        topic: d.topic,
+        decision: d.decision,
+        source: d.source,
+        basis: d.basis,
+        rejected_alternatives: d.rejected_alternatives || [],
+        created_at: d.created_at,
+      })),
+    failure_history: failureHistory,
+    superseded_count: decisions.filter((d) => d.status === 'SUPERSEDED').length,
+  };
+  if (writeFlag) {
+    writeJson('decision-memory.json', memory);
+    console.log(JSON.stringify({ written: 'decision-memory.json', total: memory.total_decisions, failure_history: failureHistory.length }, null, 2));
+  } else {
+    console.log(JSON.stringify(memory, null, 2));
+  }
+}
+
 ({
   counters,
   frontier,
@@ -689,4 +1131,8 @@ function evalMetrics() {
   ledger: ledgerCmd,
   'impact-graph': impactGraph,
   context: exportContext,
+  ir: exportIR,
+  'gate-state': gateStateCmd,
+  'evidence-pack': evidencePack,
+  'decision-memory': decisionMemory,
 })[cmd]();

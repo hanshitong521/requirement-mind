@@ -3,9 +3,24 @@
 import { existsSync, readdirSync, mkdtempSync, cpSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
-import { gateEnvelope, printGateReport } from "../../shared/scripts/peak-gate-lib.mjs";
+
+// V5：peak-gate-lib 可能在多位置（旧仓库期望 shared/ 在 requirement-mind 同级，
+// 新仓库 shared/ 在 A-skill 根下），多路径回退，最后给清晰错误。
+const here = dirname(fileURLToPath(import.meta.url));
+const libCandidates = [
+  join(here, "../../shared/scripts/peak-gate-lib.mjs"),
+  join(here, "../../../shared/scripts/peak-gate-lib.mjs"),
+  join(here, "../../../../shared/scripts/peak-gate-lib.mjs"),
+];
+const libPath = libCandidates.find((p) => existsSync(p));
+if (!libPath) {
+  console.error("peak-gate-lib.mjs 未在以下相对路径找到，请检查仓库结构：");
+  for (const p of libCandidates) console.error("  - " + p);
+  process.exit(1);
+}
+const { gateEnvelope, printGateReport } = await import(pathToFileURL(libPath).href);
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
